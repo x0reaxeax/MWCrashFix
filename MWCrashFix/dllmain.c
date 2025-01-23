@@ -504,6 +504,39 @@ VOID PatchRefs(VOID) {
             &dwOldProtect
         );
     }
+
+    // Patch 0x6865F0 offending call
+    BYTE abPatch[3] = {
+        0x33, 0xc0,     // xor    eax,eax
+        0x40            // inc    eax
+    };
+    DWORD dwOldProtect;
+    if (!VirtualProtect(
+        (LPVOID) 0x006865F0,
+        3, 
+        PAGE_EXECUTE_READWRITE, 
+        &dwOldProtect
+    )) {
+        MessageBoxA(NULL, "VirtualProtect failed", "Error", MB_ICONERROR);
+        return;
+    }
+
+    memcpy((LPVOID) 0x006865F0, abPatch, 3);
+
+    VirtualProtect(
+        (LPVOID) 0x006865F0,
+        3,
+        dwOldProtect,
+        &dwOldProtect
+    );
+
+    if (EXIT_SUCCESS != memcmp(
+        abPatch,
+        (LPVOID) 0x006865F0,
+        3
+    )) {
+        MessageBoxA(NULL, "Patch failed for offending call 0x006865F0", "Error", MB_ICONERROR);
+    }
 }
 
 BOOL WINAPI DllMain(
