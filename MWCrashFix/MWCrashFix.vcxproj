@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -178,11 +178,15 @@ rename "$(OutDir)$(TargetName)$(TargetExt)" "$(TargetName).asi"</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.c" />
+    <ClCompile Include="Zydis.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Zydis.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <Target Name="ASIClean" AfterTargets="Clean">
-  	<Delete Files="$(OutDir)$(TargetName).asi" />
+    <Delete Files="$(OutDir)$(TargetName).asi" />
   </Target>
 </Project>

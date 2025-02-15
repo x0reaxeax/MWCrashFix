@@ -1,6 +1,12 @@
 #include <stdio.h>
 #include <Windows.h>
 
+#include "Zydis.h"
+
+#pragma warning(disable: 4996)
+
+#define GLOBAL
+
 typedef struct _PATCHINFO {
     DWORD dwAddress;    // Target instruction address
     DWORD dwSize;       // Number of instruction bytes, 6 or 7.
@@ -8,6 +14,7 @@ typedef struct _PATCHINFO {
                         // Can be omitted by opting to only patch the source MOV address.
 } PATCHINFO, *LPPATCHINFO;
 
+GLOBAL FILE *fpLogfile = NULL;
 
 const static PATCHINFO aPatches[] = {
     { 0x00401F1D, 6, { 0xc7, 0x06, 0x28, 0xa8, 0x8a, 0x00 } },       // mov    DWORD PTR [esi],0x8aa828
@@ -446,7 +453,222 @@ const static PATCHINFO aPatches[] = {
     { 0x00758FB8, 6, { 0xc7, 0x06, 0x28, 0xa8, 0x8a, 0x00 } }        // mov    DWORD PTR [esi],0x8aa828
 };
 
-VOID PatchRefs(VOID) {
+ZydisMnemonic GetInstructionMnemonic(
+    IN  LPVOID lpInstructionAddress
+    //OUT LPSTR lpBuffer
+) {
+    ZydisDisassembledInstruction Instruction;
+    if (!ZYAN_SUCCESS(ZydisDisassembleIntel(
+        ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
+        (ZyanU64) lpInstructionAddress,
+        lpInstructionAddress,
+        0x0F,
+        &Instruction
+    ))) {
+        return ZYDIS_MNEMONIC_INVALID;
+    }
+    //strncpy(lpBuffer, sizeof(Instruction.text), Instruction.text);
+    return Instruction.info.mnemonic;
+}
+
+UINT8 GetInstructionLength(
+    IN LPVOID lpInstructionAddress
+) {
+    ZydisDisassembledInstruction Instruction;
+    if (!ZYAN_SUCCESS(ZydisDisassembleIntel(
+        ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
+        (ZyanU64) lpInstructionAddress,
+        lpInstructionAddress,
+        0x0F,
+        &Instruction
+    ))) {
+        return 0;
+    }
+    return Instruction.info.length;
+}
+
+VOID DumpAndExit(
+    LPEXCEPTION_POINTERS lpExceptionInfo
+) {
+    fprintf(
+        stderr,
+        "Exception code: 0x%08X\n"
+        "Exception address: 0x%08X\n"
+        "EAX: 0x%08X\n"
+        "EBX: 0x%08X\n"
+        "ECX: 0x%08X\n"
+        "EDX: 0x%08X\n"
+        "ESI: 0x%08X\n"
+        "EDI: 0x%08X\n"
+        "EBP: 0x%08X\n"
+        "ESP: 0x%08X\n"
+        "EIP: 0x%08X\n"
+        "EFLAGS: 0x%08X\n"
+        "STACK [8 ENTRIES]:\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n"
+        " * 0x%08X\n",
+        lpExceptionInfo->ExceptionRecord->ExceptionCode,
+        (DWORD) lpExceptionInfo->ExceptionRecord->ExceptionAddress,
+        lpExceptionInfo->ContextRecord->Eax,
+        lpExceptionInfo->ContextRecord->Ebx,
+        lpExceptionInfo->ContextRecord->Ecx,
+        lpExceptionInfo->ContextRecord->Edx,
+        lpExceptionInfo->ContextRecord->Esi,
+        lpExceptionInfo->ContextRecord->Edi,
+        lpExceptionInfo->ContextRecord->Ebp,
+        lpExceptionInfo->ContextRecord->Esp,
+        lpExceptionInfo->ContextRecord->Eip,
+        lpExceptionInfo->ContextRecord->EFlags,
+        *(DWORD *) lpExceptionInfo->ContextRecord->Esp,
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 4),
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 8),
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 12),
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 16),
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 20),
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 24),
+        *(DWORD *) (lpExceptionInfo->ContextRecord->Esp + 28)
+    );
+
+    fprintf(fpLogfile, "[MWCrashFix]: === LOGFILE END ===\n");
+    fclose(fpLogfile);
+
+    exit(STATUS_ACCESS_VIOLATION);
+}
+
+LONG WINAPI VectoredHandler(
+    IN LPEXCEPTION_POINTERS lpExceptionInfo
+) {
+    if (EXCEPTION_ACCESS_VIOLATION != lpExceptionInfo->ExceptionRecord->ExceptionCode) {
+        // Let other handlers try
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    DWORD dwStackAddress = *(DWORD *) lpExceptionInfo->ContextRecord->Esp;
+
+    fprintf(
+        fpLogfile,
+        "[MWCrashFix]: Faulting address:  0x%08X\n",
+        (DWORD) lpExceptionInfo->ExceptionRecord->ExceptionAddress
+    );
+
+    if (0 == lpExceptionInfo->ExceptionRecord->ExceptionAddress) {
+        fprintf(
+            fpLogfile,
+            "[MWCrashFix]: Top stack address: 0x%08X\n",
+            dwStackAddress
+        );
+    }
+
+    // Get page protection of the faulting address
+    MEMORY_BASIC_INFORMATION MemoryInfo = { 0 };
+    if (!VirtualQuery(
+        lpExceptionInfo->ExceptionRecord->ExceptionAddress,
+        &MemoryInfo,
+        sizeof(MemoryInfo)
+    )) {
+        fprintf(
+            fpLogfile,
+            "[MWCrashFix]: VirtualQuery() - E%lu\n",
+            GetLastError()
+        );
+        DumpAndExit(lpExceptionInfo);
+    }
+
+    ZydisMnemonic Mnemonic = GetInstructionMnemonic(
+        lpExceptionInfo->ExceptionRecord->ExceptionAddress
+    );
+
+    if (
+        // Faulting address is not on an RX page
+        !(PAGE_EXECUTE_READ & MemoryInfo.Protect) ||
+        // Instruction is invalid, but in an RX page
+        ((PAGE_EXECUTE_READ & MemoryInfo.Protect) && ZYDIS_MNEMONIC_INVALID == Mnemonic)
+    ) {
+        // Bad context-altering instruction landed execution on a non-RX page.
+        // Try to recover by evaluating the address on top of stack.
+        ZeroMemory(&MemoryInfo, sizeof(MemoryInfo));
+        if (!VirtualQuery(
+            (LPCVOID) dwStackAddress,
+            &MemoryInfo,
+            sizeof(MemoryInfo)
+        )) {
+            fprintf(
+                fpLogfile,
+                "[MWCrashFix]: VirtualQuery() - E%lu\n",
+                GetLastError()
+            );
+            DumpAndExit(lpExceptionInfo);
+        }
+
+        if (!(PAGE_EXECUTE_READ & MemoryInfo.Protect)) {
+            // stack doesn't point to an RX page, give up
+            fprintf(
+                fpLogfile,
+                "[MWCrashFix]: Stack stored address is not on an RX page\n"
+            );
+            DumpAndExit(lpExceptionInfo);
+        }
+
+        Mnemonic = GetInstructionMnemonic(
+            (LPVOID) dwStackAddress
+        );
+
+        if (ZYDIS_MNEMONIC_INVALID == Mnemonic) {
+            // return address points to an invalid instruction, give up
+            fprintf(
+                fpLogfile,
+                "[MWCrashFix]: Invalid instruction mnemonic\n"
+            );
+            DumpAndExit(lpExceptionInfo);
+        }
+
+        lpExceptionInfo->ContextRecord->Eip = dwStackAddress;
+
+        // Adjust stack pointer
+        lpExceptionInfo->ContextRecord->Esp += sizeof(DWORD);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+
+    UINT8 u8InstructionLength = 0;
+    if (ZYDIS_MNEMONIC_INVALID != Mnemonic) {
+        u8InstructionLength = GetInstructionLength(
+            lpExceptionInfo->ExceptionRecord->ExceptionAddress
+        );
+
+        if (0 == u8InstructionLength) {
+            // 0 instruction length, give up
+            fprintf(
+                fpLogfile,
+                "[MWCrashFix]: Invalid instruction length\n"
+            );
+            DumpAndExit(lpExceptionInfo);
+        }
+
+        lpExceptionInfo->ContextRecord->Eip += u8InstructionLength;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Failed to recover
+    fprintf(
+        fpLogfile,
+        "[MWCrashFix]: Failed to recover from exception\n"
+    );
+    DumpAndExit(lpExceptionInfo);
+
+    // Unreachable, just to make the compiler happy
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+VOID PatchRefs(
+    VOID
+) {
     for (DWORD i = 0; i < ARRAYSIZE(aPatches); i++) {
         // Check if a correct instruction is present at the address
         CONST DWORD dwBadAddress = 0x00890970;
@@ -464,14 +686,14 @@ VOID PatchRefs(VOID) {
         );
 
         if (EXIT_SUCCESS != memcmp(
-            abInstruction, 
-            (LPVOID) aPatches[i].dwAddress, 
+            abInstruction,
+            (LPVOID) aPatches[i].dwAddress,
             aPatches[i].dwSize
         )) {
             CHAR szMessage[256] = { 0 };
             snprintf(
-                szMessage, 
-                sizeof(szMessage), 
+                szMessage,
+                sizeof(szMessage),
                 "Unsupported speed.exe:\n\n"
                 "Instruction check %u/%u failed.\n"
                 "@ 0x%08X mismatch with check 0x%08X\n",
@@ -483,7 +705,7 @@ VOID PatchRefs(VOID) {
             MessageBoxA(NULL, szMessage, "MWCrashFix Error", MB_ICONERROR);
             return;
         }
-        
+
         // Patch the instruction
         DWORD dwOldProtect;
         if (!VirtualProtect(
@@ -504,39 +726,6 @@ VOID PatchRefs(VOID) {
             &dwOldProtect
         );
     }
-
-    // Patch 0x6865F0 offending call
-    BYTE abPatch[3] = {
-        0x33, 0xc0,     // xor    eax,eax
-        0x40            // inc    eax
-    };
-    DWORD dwOldProtect;
-    if (!VirtualProtect(
-        (LPVOID) 0x006865F0,
-        3, 
-        PAGE_EXECUTE_READWRITE, 
-        &dwOldProtect
-    )) {
-        MessageBoxA(NULL, "VirtualProtect failed", "Error", MB_ICONERROR);
-        return;
-    }
-
-    memcpy((LPVOID) 0x006865F0, abPatch, 3);
-
-    VirtualProtect(
-        (LPVOID) 0x006865F0,
-        3,
-        dwOldProtect,
-        &dwOldProtect
-    );
-
-    if (EXIT_SUCCESS != memcmp(
-        abPatch,
-        (LPVOID) 0x006865F0,
-        3
-    )) {
-        MessageBoxA(NULL, "Patch failed for offending call 0x006865F0", "Error", MB_ICONERROR);
-    }
 }
 
 BOOL WINAPI DllMain(
@@ -549,7 +738,54 @@ BOOL WINAPI DllMain(
         return TRUE;
     }
 
+    fpLogfile = fopen(
+        "mwcrashfix.log",
+        "a"
+    );
+
+    if (NULL == fpLogfile) {
+        MessageBoxA(
+            NULL,
+            "Failed to open log file",
+            "MWCrashFix",
+            MB_ICONERROR
+        );
+        return EXIT_FAILURE;
+    }
+
+    // Disable buffering
+    setbuf(fpLogfile, NULL);
+
+    fprintf(fpLogfile, "[MWCrashFix]: === LOGFILE START ===\n");
+
     PatchRefs();
+
+    fprintf(
+        fpLogfile, 
+        "[MWCrashFix]: Patched offending memory references\n"
+    );
+
+    if (NULL == AddVectoredExceptionHandler(
+        1, 
+        VectoredHandler
+    )) {
+        fprintf(
+            fpLogfile,
+            "[MWCrashFix]: AddVectoredExceptionHandler() - E%lu\n",
+            GetLastError()
+        );
+        MessageBoxA(
+            NULL,
+            "Failed to install exception handler",
+            "MWCrashFix",
+            MB_ICONERROR
+        );
+        
+        fprintf(fpLogfile, "[MWCrashFix]: === LOGFILE END ===\n");
+        fclose(fpLogfile);
+
+        return FALSE;
+    }
 
     return TRUE;
 }
